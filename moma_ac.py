@@ -12,6 +12,7 @@ class MultiAgentTD3:
                  agent_ids, 
                  obs_dims, 
                  act_dims, 
+                 preference_dim,  # FIX: Added preference_dim
                  max_action=1.0, 
                  device="cpu",
                  lr_a=3e-4, 
@@ -31,6 +32,7 @@ class MultiAgentTD3:
         self.noise_clip = noise_clip
         self.policy_freq = policy_freq
         self.total_it = 0
+        self.preference_dim = preference_dim
 
         # Calculate dimensions for Centralized Critic
         # Flatten joint state and joint action
@@ -39,26 +41,30 @@ class MultiAgentTD3:
         max_obs_dim = max(obs_dims.values())
 
         # --- Actors ---
-        self.actor = MultiHeadActor(agent_ids, obs_dims, act_dims, max_obs_dim).to(device)
+        # Pass preference_dim to Actor
+        self.actor = MultiHeadActor(agent_ids, obs_dims, act_dims, max_obs_dim, preference_dim).to(device)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_a)
 
         # --- Critics ---
-        self.critic = CentralizedCritic(joint_state_dim, joint_action_dim).to(device)
+        # Pass preference_dim to Critic (Output is now vector)
+        self.critic = CentralizedCritic(joint_state_dim, joint_action_dim, preference_dim).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_c)
 
-        # --- Replay Buffer ---
-        # Note: Initialized externally or here. We'll init here for simplicity if max_size provided
-        # but the class signature doesn't ask for max_size. 
-        # For this example, we assume buffer is passed to train()
-
-    def select_action(self, obs_dict, noise_scale=0.1):
-        """Select actions for all agents at current step"""
+    def select_action(self, obs_dict, preference, noise_scale=0.1):
+        """
+        Select actions for all agents at current step.
+        FIX: Takes preference vector as input.
+        """
         actions = {}
         for agent in self.agent_ids:
+            # Prepare inputs
             obs_tensor = torch.FloatTensor(obs_dict[agent]).unsqueeze(0).to(self.device)
-            action = self.actor.get_action_single(agent, obs_tensor)
+            pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
+            
+            # Pass preference to actor
+            action = self.actor.get_action_single(agent, obs_tensor, pref_tensor)
             
             # Add exploration noise
             if noise_scale > 0:
@@ -71,21 +77,20 @@ class MultiAgentTD3:
     def train(self, replay_buffer, batch_size=256):
         self.total_it += 1
 
-        # 1. Sample Replay Buffer
-        obs, actions, rewards, next_obs, dones = replay_buffer.sample(batch_size)
+        # 1. Sample Replay Buffer (Now includes preferences)
+        obs, actions, rewards, next_obs, dones, preferences = replay_buffer.sample(batch_size)
 
         # Prepare joint tensors (Concatenate all agents)
-        # We need a consistent order, so we rely on self.agent_ids list
         with torch.no_grad():
             # Generate Target Actions with Noise (Target Policy Smoothing)
-            next_actions_dict = self.actor_target(next_obs)
+            # FIX: Pass preferences to target actor
+            next_actions_dict = self.actor_target(next_obs, preferences)
             
             joint_next_action_list = []
-            joint_reward = 0  # Assuming cooperative: reward is same for all, or we sum?
-            # In MaMuJoCo, rewards are usually identical for all agents. 
-            # Even if they are identical, summing will make no difference
-            # But why inflate the values? Let's use only the first agent's reward (they are identical)
-            joint_reward = joint_reward = rewards[self.agent_ids[0]]
+            
+            # In MOMA-AC, agents share the vector reward. We take agent_0's reward as the team reward.
+            # rewards shape: [batch, preference_dim]
+            joint_reward = rewards[self.agent_ids[0]] 
             joint_done = dones[self.agent_ids[0]]
 
             for agent in self.agent_ids:
@@ -96,17 +101,35 @@ class MultiAgentTD3:
             joint_next_action = torch.cat(joint_next_action_list, dim=1)
             joint_next_obs = torch.cat([next_obs[a] for a in self.agent_ids], dim=1)
 
-            # Target Q-values
-            target_Q1, target_Q2 = self.critic_target(joint_next_obs, joint_next_action)
-            target_Q = torch.min(target_Q1, target_Q2)
-            target_Q = joint_reward + (1 - joint_done) * self.gamma * target_Q
+            # --- MOMA-TD3 Logic for Target Q (Eq. 4, 5, 6) ---
+            # 1. Get Vector Q-values from both targets
+            # Output shape: [batch, preference_dim]
+            target_Q1_vec, target_Q2_vec = self.critic_target(joint_next_obs, joint_next_action, preferences)
+            
+            # 2. Scalarize using the batch preferences (Dot product)
+            # (batch, dim) * (batch, dim) -> sum -> (batch, 1)
+            scalar_Q1 = (target_Q1_vec * preferences).sum(dim=1, keepdim=True)
+            scalar_Q2 = (target_Q2_vec * preferences).sum(dim=1, keepdim=True)
+            
+            # 3. Find index of the critic with lower SCALARIZED value
+            # [cite_start]This implements the "min-of-two" in utility space to prevent overestimation [cite: 14]
+            # Create a mask where Q1 < Q2
+            mask = (scalar_Q1 < scalar_Q2).float() # 1 if Q1 is smaller, 0 otherwise
+            
+            # 4. Select the VECTOR corresponding to the lower scalar
+            target_Q_vec = mask * target_Q1_vec + (1 - mask) * target_Q2_vec
+            
+            # 5. Bellman Update on the VECTOR
+            target_Q = joint_reward + (1 - joint_done) * self.gamma * target_Q_vec
 
-        # 2. Critic Update
+        # 2. Critic Update (Eq. 9)
         joint_state = torch.cat([obs[a] for a in self.agent_ids], dim=1)
         joint_action = torch.cat([actions[a] for a in self.agent_ids], dim=1)
 
-        current_Q1, current_Q2 = self.critic(joint_state, joint_action)
+        # Get current vector estimates
+        current_Q1, current_Q2 = self.critic(joint_state, joint_action, preferences)
 
+        # Loss is sum of MSE over vector components
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
         self.critic_optimizer.zero_grad()
@@ -117,10 +140,8 @@ class MultiAgentTD3:
         # 3. Actor Update (Delayed)
         if self.total_it % self.policy_freq == 0:
             
-            # We need the current policy's actions to calculate the gradient
-            # But we must be careful:
-            # We want to differentiate wrt the actions output by the actor.
-            current_actions_dict = self.actor(obs)
+            # Get current policy actions
+            current_actions_dict = self.actor(obs, preferences)
             current_joint_action_list = []
             
             for agent in self.agent_ids:
@@ -128,8 +149,15 @@ class MultiAgentTD3:
             
             current_joint_action = torch.cat(current_joint_action_list, dim=1)
 
-            # Maximize Q1
-            actor_loss = -self.critic.Q1(joint_state, current_joint_action).mean()
+            # --- MOMA-TD3 Logic for Actor Loss (Eq. 10, 11, 12) ---
+            # 1. Get Q1 Vector
+            q1_vec = self.critic.Q1(joint_state, current_joint_action, preferences)
+            
+            # 2. Scalarize using preference vector
+            utility = (q1_vec * preferences).sum(dim=1)
+            
+            # 3. Maximize Utility (Minimize negative utility)
+            actor_loss = -utility.mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
