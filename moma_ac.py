@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import copy
+import os
 
 from actor import MultiHeadActor
 from critics import CentralizedCritic
@@ -12,7 +13,7 @@ class MultiAgentTD3:
                  agent_ids, 
                  obs_dims, 
                  act_dims, 
-                 preference_dim,  # FIX: Added preference_dim
+                 preference_dim, 
                  max_action=1.0, 
                  device="cpu",
                  lr_a=3e-4, 
@@ -77,13 +78,13 @@ class MultiAgentTD3:
     def train(self, replay_buffer, batch_size=256):
         self.total_it += 1
 
-        # 1. Sample Replay Buffer (Now includes preferences)
+        # 1. Sample Replay Buffer
         obs, actions, rewards, next_obs, dones, preferences = replay_buffer.sample(batch_size)
 
         # Prepare joint tensors (Concatenate all agents)
         with torch.no_grad():
             # Generate Target Actions with Noise (Target Policy Smoothing)
-            # FIX: Pass preferences to target actor
+            # Pass preferences to target actor
             next_actions_dict = self.actor_target(next_obs, preferences)
             
             joint_next_action_list = []
@@ -122,7 +123,7 @@ class MultiAgentTD3:
             # 5. Bellman Update on the VECTOR
             target_Q = joint_reward + (1 - joint_done) * self.gamma * target_Q_vec
 
-        # 2. Critic Update (Eq. 9)
+        # 2. Critic Update
         joint_state = torch.cat([obs[a] for a in self.agent_ids], dim=1)
         joint_action = torch.cat([actions[a] for a in self.agent_ids], dim=1)
 
@@ -170,3 +171,27 @@ class MultiAgentTD3:
 
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def save(self, filename):
+        torch.save({
+            'total_it': self.total_it,
+            'actor': self.actor.state_dict(),
+            'actor_target': self.actor_target.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+        }, filename)
+
+    def load(self, filename):
+        checkpoint = torch.load(filename, map_location=self.device)
+        
+        self.total_it = checkpoint['total_it']
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.actor_target.load_state_dict(checkpoint['actor_target'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        
+        print(f"Loaded agent model from {filename} (Total Iterations: {self.total_it})")

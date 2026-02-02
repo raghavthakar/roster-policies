@@ -27,7 +27,7 @@ class MultiAgentReplayBuffer:
     def add(self, obs_dict, action_dict, reward_dict, next_obs_dict, done_dict, preference):
         """
         Add a transition. Expects dictionaries with agent_id keys.
-        Now includes preference vector.
+        Includes preference vector.
         """
         # Store the global preference for this step
         self.preferences[self.ptr] = preference
@@ -65,3 +65,42 @@ class MultiAgentReplayBuffer:
 
         # Return preferences along with standard batch data
         return batch_obs, batch_actions, batch_rewards, batch_next_obs, batch_dones, batch_preferences
+
+    def save_state(self, filename):
+        """Saves buffer content to a compressed .npz file"""
+        save_dict = {
+            'ptr': self.ptr,
+            'size': self.size,
+            'preferences': self.preferences
+        }
+        # Flatten dictionary structure for numpy saving
+        for agent in self.agent_ids:
+            save_dict[f'obs_{agent}'] = self.obs[agent]
+            save_dict[f'next_obs_{agent}'] = self.next_obs[agent]
+            save_dict[f'actions_{agent}'] = self.actions[agent]
+            save_dict[f'rewards_{agent}'] = self.rewards[agent]
+            save_dict[f'dones_{agent}'] = self.dones[agent]
+        
+        np.savez_compressed(filename, **save_dict)
+        print(f"Replay buffer saved to {filename}")
+
+    def load_state(self, filename):
+        """Loads buffer content from a .npz file"""
+        if not filename.endswith('.npz'):
+            filename += '.npz'
+            
+        data = np.load(filename)
+        
+        self.ptr = int(data['ptr'])
+        self.size = int(data['size'])
+        self.preferences = data['preferences']
+        
+        # Reconstruct dictionary structure
+        for agent in self.agent_ids:
+            self.obs[agent] = data[f'obs_{agent}']
+            self.next_obs[agent] = data[f'next_obs_{agent}']
+            self.actions[agent] = data[f'actions_{agent}']
+            self.rewards[agent] = data[f'rewards_{agent}']
+            self.dones[agent] = data[f'dones_{agent}']
+            
+        print(f"Replay buffer loaded from {filename} (Size: {self.size})")
