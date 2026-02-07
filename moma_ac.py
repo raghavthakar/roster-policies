@@ -4,7 +4,7 @@ import numpy as np
 import copy
 import os
 
-from actor import MultiHeadActor
+from actor import MultiHeadActor, MomaMoEActor
 from critics import CentralizedCritic
 from replay_buffer import MultiAgentReplayBuffer
 
@@ -22,7 +22,10 @@ class MultiAgentTD3:
                  tau=0.005,
                  policy_noise=0.2,
                  noise_clip=0.5,
-                 policy_freq=2):
+                 policy_freq=2,
+                 use_moe=False,       # Toggle for Mixture of Experts
+                 num_experts=3,       # Number of experts per agent (if MOE)
+                 moe_lambda=0.01):    # Regularization strength for router entropy
         
         self.agent_ids = agent_ids
         self.device = device
@@ -34,6 +37,8 @@ class MultiAgentTD3:
         self.policy_freq = policy_freq
         self.total_it = 0
         self.preference_dim = preference_dim
+        self.use_moe = use_moe
+        self.moe_lambda = moe_lambda
 
         # Calculate dimensions for Centralized Critic
         # Flatten joint state and joint action
@@ -42,8 +47,12 @@ class MultiAgentTD3:
         max_obs_dim = max(obs_dims.values())
 
         # --- Actors ---
-        # Pass preference_dim to Actor
-        self.actor = MultiHeadActor(agent_ids, obs_dims, act_dims, max_obs_dim, preference_dim).to(device)
+        # Conditionally instantiate the correct Actor architecture
+        if self.use_moe:
+            self.actor = MomaMoEActor(agent_ids, obs_dims, act_dims, max_obs_dim, preference_dim, num_experts=num_experts).to(device)
+        else:
+            self.actor = MultiHeadActor(agent_ids, obs_dims, act_dims, max_obs_dim, preference_dim).to(device)
+            
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_a)
 
@@ -65,6 +74,7 @@ class MultiAgentTD3:
             pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
             
             # Pass preference to actor
+            # Both MultiHeadActor and MomaMoEActor support get_action_single with the same signature
             action = self.actor.get_action_single(agent, obs_tensor, pref_tensor)
             
             # Add exploration noise
@@ -84,8 +94,11 @@ class MultiAgentTD3:
         # Prepare joint tensors (Concatenate all agents)
         with torch.no_grad():
             # Generate Target Actions with Noise (Target Policy Smoothing)
-            # Pass preferences to target actor
-            next_actions_dict = self.actor_target(next_obs, preferences)
+            # Handle return tuple if MOE is used
+            if self.use_moe:
+                next_actions_dict, _ = self.actor_target(next_obs, preferences)
+            else:
+                next_actions_dict = self.actor_target(next_obs, preferences)
             
             joint_next_action_list = []
             
@@ -142,9 +155,12 @@ class MultiAgentTD3:
         if self.total_it % self.policy_freq == 0:
             
             # Get current policy actions
-            current_actions_dict = self.actor(obs, preferences)
+            if self.use_moe:
+                current_actions_dict, router_weights = self.actor(obs, preferences)
+            else:
+                current_actions_dict = self.actor(obs, preferences)
+
             current_joint_action_list = []
-            
             for agent in self.agent_ids:
                 current_joint_action_list.append(current_actions_dict[agent])
             
@@ -159,6 +175,18 @@ class MultiAgentTD3:
             
             # 3. Maximize Utility (Minimize negative utility)
             actor_loss = -utility.mean()
+
+            # --- MOE Entropy Regularization ---
+            # Encourage the router to maintain a soft distribution (high entropy)
+            # This prevents early collapse to a single expert.
+            if self.use_moe:
+                entropy_loss = 0
+                for agent in self.agent_ids:
+                    probs = router_weights[agent]
+                    # Minimizing (p * log p) is equivalent to Maximizing Entropy H = -sum(p log p)
+                    entropy_loss += (probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                
+                actor_loss += self.moe_lambda * entropy_loss
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
