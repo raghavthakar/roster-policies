@@ -11,7 +11,7 @@ from mo_mamujoco_wrapper import MOMaMuJoCoWrapper
 # --- Default Constants ---
 ENV_NAME = "Ant"
 AGENT_CONF = "2x4"
-MAX_STEPS = 500_000        # Total environment steps to train for
+MAX_STEPS = 2_000_000        # Total environment steps to train for
 MAX_STEPS_PER_EP = 1000
 BATCH_SIZE = 256
 BUFFER_SIZE = 1_000_000
